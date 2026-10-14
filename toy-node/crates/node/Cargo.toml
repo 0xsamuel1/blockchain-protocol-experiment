@@ -10,6 +10,7 @@ primitives.workspace = true
 alloy.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+revm = "43.0.3"
 
 [dev-dependencies]
 alloy.workspace = true

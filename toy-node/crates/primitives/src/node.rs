@@ -401,7 +401,7 @@ impl BlockState {
         self.receipts.get(hash)
     }
 
-    // account queries 
+    // account queries
 
     /// Account at the chain head. An address nobody has ever funded reads as an
     /// empty account rather than an error, exactly as on Ethereum.

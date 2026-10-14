@@ -53,19 +53,16 @@ fn resolve_tag(state: &BlockState, tag: &BlockTag) -> Result<u64, ErrorObjectOwn
     tag.resolve(state.get_block_number()).map_err(invalid_input)
 }
 
-
 /// The chain's id, used by wallets for EIP-155 replay protection.
 pub fn chain_id_handler() -> String {
     quantity(CHAIN_ID)
 }
-
 
 /// The number of the chain head. A freshly started node sits at `0x0`, the genesis
 /// block, and climbs from there as the miner seals blocks.
 pub fn block_number_handler(context: &RPCContext) -> String {
     quantity(context.chain.read().get_block_number())
 }
-
 
 /// Renders a block, inlining full transaction objects if the caller asked for them.
 fn render_block(state: &BlockState, number: u64, full_transactions: bool) -> Value {
@@ -122,8 +119,6 @@ pub fn get_block_by_hash_handler(params: Params<'_>, context: &RPCContext) -> Rp
     Ok(render_block(&state, number, full_transactions))
 }
 
-
-
 pub fn get_transaction_by_hash_handler(
     params: Params<'_>,
     context: &RPCContext,
@@ -156,7 +151,6 @@ pub fn get_transaction_receipt_handler(
         None => Ok(Value::Null),
     }
 }
-
 
 pub fn get_balance_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
     let mut sequence = params.sequence();
@@ -208,7 +202,6 @@ pub fn get_transaction_count_handler(
     Ok(quantity(nonce))
 }
 
-
 /// Accepts a signed transaction, validates it, and queues it for mining.
 ///
 /// The response is the transaction hash, returned the moment the transaction is
@@ -228,7 +221,6 @@ pub fn send_raw_transaction_handler(params: Params<'_>, context: &RPCContext) ->
 
     Ok(data_hash(&hash))
 }
-
 
 /// Executes a read-only call.
 ///

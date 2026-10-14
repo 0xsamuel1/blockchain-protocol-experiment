@@ -81,7 +81,7 @@ fn run(chain: Chain) {
             nonce: 0,
         };
 
-        // the proof of work, also with no lock held 
+        // the proof of work, also with no lock held
         //
         // The search is abandoned if the node is shutting down, or if a new
         // transaction arrives: there is no point spending another ten seconds on a

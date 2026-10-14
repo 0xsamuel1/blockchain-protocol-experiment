@@ -26,7 +26,6 @@ pub const DEV_TARGET_BLOCK_TIME_SECS: u64 = 2;
 pub const MIN_DIFFICULTY_LEADING_ZEROS: u8 = 1;
 pub const MAX_DIFFICULTY_LEADING_ZEROS: u8 = 32;
 
-
 /// Breeja predates EIP-1559, so gas price is a single fixed constant (1 gwei)
 /// rather than a per-block base fee.
 pub const GAS_PRICE: u128 = 1_000_000_000;
@@ -45,8 +44,6 @@ pub const BLOCK_REWARD: U256 = U256::from_limbs([5_000_000_000_000_000_000, 0, 0
 
 /// Free-form bytes the miner stamps into each block it seals.
 pub const EXTRA_DATA: &str = "breeja";
-
-
 
 /// First well-known development account. This is Anvil/Hardhat account first dev account
 pub const DEV_ADDRESS: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");

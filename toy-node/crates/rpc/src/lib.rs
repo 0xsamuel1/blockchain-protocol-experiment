@@ -65,7 +65,6 @@ pub async fn start_server(
         |params, context, _extensions| get_transaction_receipt_handler(params, context),
     )?;
 
-
     module.register_method("eth_getBalance", |params, context, _extensions| {
         get_balance_handler(params, context)
     })?;
@@ -74,11 +73,9 @@ pub async fn start_server(
         get_transaction_count_handler(params, context)
     })?;
 
-
     module.register_method("eth_sendRawTransaction", |params, context, _extensions| {
         send_raw_transaction_handler(params, context)
     })?;
-
 
     module.register_method("eth_call", |params, context, _extensions| {
         call_handler(params, context)
