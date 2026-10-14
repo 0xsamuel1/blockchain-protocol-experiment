@@ -7,7 +7,7 @@
 - Release build: passed with `cargo build --release` before the REVM dependency was added.
 - Clippy: passed with `cargo clippy --workspace --all-targets -- -D warnings` before the REVM dependency was added.
 - Development mining: `cargo run --release -- --dev` starts the local JSON-RPC server with a low initial difficulty and a two-second target. With `RUST_LOG=info`, the node sealed blocks continuously, retargeting difficulty as seal times changed. It shut down cleanly on Ctrl-C.
-- REVM: `43.0.3` is added to the `node` crate. This milestone only adds the dependency; Breeja does not use it yet.
+- REVM: `43.0.3` is used by the node's snapshot database adapter. Transaction execution is still unchanged.
 
 ## Current architecture
 
@@ -36,10 +36,60 @@ Admission reserves `gas_limit × gas_price` (plus value) against the sender's pe
 
 `BlockState` stores the latest account map and pushes a clone of the complete map into `state_history` after every block. This is simple and supports historical balance and nonce queries, but storage cost grows with both the number of accounts and the number of blocks. Once contracts introduce code and potentially many storage slots per account, copying complete account snapshots for every block becomes increasingly expensive. A state trie or another incremental/versioned storage design will be needed as the project grows.
 
-The current `Account` has nonce, balance, `storage_root`, and `code_hash` fields, but Breeja does not store or expose contract bytecode or storage values. Its state root is a sorted concatenation hash of the current account records, not an Ethereum Merkle-Patricia trie, and the transaction and receipt roots are likewise simplified hashes. These are teaching-model limitations, not completed Ethereum state commitments.
+Before Milestone 1, Breeja's `Account` had nonce, balance, `storage_root`, and `code_hash` fields without storing contract bytecode or storage values. Milestone 1 adds those state values, but Breeja still does not expose them through RPC or execute contracts. Its state root is a sorted concatenation hash of account records, not an Ethereum Merkle-Patricia trie, and the transaction and receipt roots are likewise simplified hashes. These are teaching-model limitations, not completed Ethereum state commitments.
 
 ### Mining and RPC flow
 
 The miner snapshots accounts, the chain head, and a mempool batch, executes the candidate transactions without holding the chain lock, then searches for a proof-of-work nonce. In development mode the starting difficulty is low and the target block time is two seconds. A newly admitted transaction changes the mempool generation and can cause the miner to abandon and rebuild its candidate. After sealing, the miner commits the resulting accounts, block, transactions, and receipts.
 
 The JSON-RPC surface provides chain, block, transaction, receipt, balance, nonce, raw-transaction submission, `eth_call`, and `eth_estimateGas` methods. The latter two are intentionally limited: calls needing contract creation or calldata fail because there is no EVM yet. This note records the current limitations and the integration direction; no execution, state model, mempool validation, or RPC behavior has been changed in Milestone 0.
+
+## Milestone 1: code and storage state
+
+### Representation
+
+`Account` now owns its storage slots as `HashMap<U256, U256>`. The existing
+`storage_root` field is set to a deterministic hash of sorted slot/value pairs
+when REVM changes are committed, and the same value is derived for state-root
+calculation. This keeps the teaching model simple and deterministic, but it is not Ethereum's storage
+Merkle-Patricia trie root. The slot map has a serde default so previously serialized
+accounts without a `storage` field still deserialize.
+
+Bytecode is stored once in `BlockState` as `HashMap<B256, Bytes>`, keyed by its
+Keccak code hash; each account's existing `code_hash` refers to that content. This
+avoids duplicating identical code and matches REVM's `code_by_hash` lookup. A small
+in-memory content cache is appropriate for Breeja; a production node would persist
+the code store and validate it as part of its state backend. `BreejaDb::from_state`
+copies the accounts, converts cached byte strings into REVM `Bytecode`, and copies
+known block hashes into an owned execution snapshot.
+
+### REVM database behavior
+
+`BreejaDb` implements REVM 43.0.3's `Database` and `DatabaseCommit` traits. The
+adapter owns the snapshot instead of implementing the traits on the live
+`BlockState`, so REVM's mutable database access cannot hold the chain's shared lock.
+`DatabaseCommit` applies touched balances and nonces, stores newly supplied code by
+its computed hash, applies each storage slot's present value, removes zero-valued
+slots, refreshes the storage root, and removes accounts marked self-destructed.
+Newly created accounts clear any old slots before applying their resulting storage.
+
+An unknown address returns `None` from `basic`, matching REVM's representation of
+a nonexistent account. Existing accounts with no bytecode report the empty-code
+hash and empty bytecode. `code_by_hash` returns an empty `Bytecode` if its hash is
+not in the snapshot cache; the higher-level `BlockState::get_code_by_hash` instead
+returns `None` for an unknown non-empty hash. A missing storage slot, including a
+slot under an unknown account, reads as zero.
+
+This milestone only adds state access and a database adapter. The miner does not
+yet run transactions through REVM, and there is not yet an execution path that
+installs an adapter's committed snapshot back into `BlockState`. The custom state
+and storage hashes also remain educational substitutes for Ethereum tries.
+
+### Milestone 1 verification
+
+The baseline workspace run passed all 48 tests when run outside the restricted
+sandbox; the earlier RPC failures were caused by the sandbox denying local socket
+binding. Milestone 1 adds six database adapter tests and two state-model tests. Final
+validation also passed outside the sandbox: `cargo fmt --all -- --check`,
+`cargo test --workspace` (56 passed, 0 failed), `cargo build --release`, and
+`cargo clippy --workspace --all-targets -- -D warnings`.
