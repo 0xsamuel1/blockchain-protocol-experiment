@@ -93,3 +93,69 @@ binding. Milestone 1 adds six database adapter tests and two state-model tests. 
 validation also passed outside the sandbox: `cargo fmt --all -- --check`,
 `cargo test --workspace` (56 passed, 0 failed), `cargo build --release`, and
 `cargo clippy --workspace --all-targets -- -D warnings`.
+
+## Milestone 2: transfers through REVM
+
+### Transaction and block environments
+
+The miner now creates a `BreejaDb` from the current account, bytecode, and block
+hash snapshots while it briefly holds the state read lock. It releases that lock
+before executing the batch. Each `PendingTransaction` becomes a legacy REVM
+`TxEnv`: `from` is the caller, `to` is a call target, and Breeja's value, nonce,
+gas limit, gas price, and chain ID are copied into the corresponding fields.
+Transaction data remains empty; creation and calldata are still rejected by the
+mempool.
+
+The candidate block becomes a `BlockEnv` with its number, monotonic timestamp,
+`BLOCK_GAS_LIMIT`, and configured miner as beneficiary. Its base fee is zero because
+Breeja has no EIP-1559 fee market; a nonzero base fee would burn part of the fee and
+break supply conservation. `prevrandao` uses the parent block hash because the
+candidate block hash is not available until after execution and proof of work.
+Execution uses `SpecId::SHANGHAI`, a teaching compromise that gives modern EVM
+semantics while Breeja's surrounding chain still has its simple Frontier-style
+reward and fee model.
+
+### State and accounting
+
+Each transaction is executed with REVM 43.0.3 against the owned database snapshot.
+After the EVM object is dropped, successful state changes are committed into that
+snapshot. REVM credits the block beneficiary for transaction gas, so Breeja does
+not credit that fee a second time. REVM also advances the sender nonce; Breeja does
+not increment it manually. Breeja still adds its block reward after the batch,
+since that reward is separate from transaction fees. After proof of work, the
+updated accounts and code cache are installed with the sealed block. The live state
+lock is held only for the short snapshot and commit operations, not EVM execution or
+mining.
+
+REVM validity errors and unsuccessful execution results are reported and the
+transaction is skipped by this transfer-only executor. The current admission rules
+mean no contract code, calldata, or creation is expected to execute. Milestone 3
+will need to distinguish invalid transactions, which are skipped, from valid
+contract executions that revert, which must be included with receipt status `0x0`.
+The existing receipt model still reports successful transfer receipts and does not
+yet model contract addresses or logs.
+
+### Milestone 2 verification
+
+The baseline before these changes passed 56 workspace tests. Final validation passed
+with 57 tests: 20 node unit tests, 8 mining integration tests, 16 primitives tests,
+and 13 JSON-RPC integration tests. The new REVM parity test confirms a transfer
+uses exactly 21,000 transaction gas, moves the requested value, charges and credits
+the fee once, advances the nonce once, preserves supply, creates no contract
+address, and emits no logs. Successful receipt status and cumulative gas are checked
+in the block-execution test. The existing supply-conservation integration test
+passes without changes.
+
+`cargo fmt --all -- --check`, `cargo test -p node`,
+`cargo test -p node --test mining`, `cargo test --workspace`,
+`cargo build --release`, and
+`cargo clippy --workspace --all-targets -- -D warnings` passed. The full workspace
+test run was executed outside the restricted sandbox so its local RPC server tests
+could bind sockets.
+
+The release node was run in development mode and its local JSON-RPC endpoint
+reported block number `0x1a` (26), confirming that blocks were mined. The process
+was stopped with Ctrl-C. `cast` is not installed in this environment, so the
+README's interactive `cast mktx` workflow could not be run. The signed-transfer
+mining integration test exercises transaction admission, mining, balances, fee,
+nonce, and receipt end to end instead.
