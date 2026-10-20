@@ -72,7 +72,8 @@ pub struct TransactionResponse {
     pub transaction_index: String,
     pub chain_id: String,
     pub from: String,
-    pub to: String,
+    /// `null` for contract-creation transactions.
+    pub to: Option<String>,
     pub value: String,
     pub nonce: String,
     pub gas: String,
@@ -95,14 +96,14 @@ pub struct TransactionReceiptResponse {
     pub block_hash: String,
     pub block_number: String,
     pub from: String,
-    pub to: String,
+    /// `null` for contract-creation transactions.
+    pub to: Option<String>,
     pub gas_used: String,
     pub cummulative_gas_used: String,
     pub effective_gas_price: String,
-    /// Always `null`: deploying a contract needs an EVM, so Breeja rejects it.
+    /// The created address for successful contract creation, otherwise `null`.
     pub contract_address: Option<String>,
-    /// Always empty: logs are emitted by the `LOG*` opcodes, and there is no EVM
-    /// to execute them.
+    /// Logs emitted by successful EVM execution.
     pub logs: Vec<serde_json::Value>,
     pub logs_bloom: String,
     pub status: String,
@@ -146,7 +147,7 @@ impl From<&Transaction> for TransactionResponse {
             transaction_index: quantity(tx.transaction_index),
             chain_id: quantity(tx.chain_id),
             from: data_address(&tx.from),
-            to: data_address(&tx.to),
+            to: tx.to.as_ref().map(data_address),
             value: quantity(tx.value),
             nonce: quantity(tx.nonce),
             gas: quantity(tx.gas),
@@ -168,12 +169,22 @@ impl From<&TransactionReceipt> for TransactionReceiptResponse {
             block_hash: data_hash(&receipt.block_hash),
             block_number: quantity(receipt.block_number),
             from: data_address(&receipt.from),
-            to: data_address(&receipt.to),
+            to: receipt.to.as_ref().map(data_address),
             gas_used: quantity(receipt.gas_used),
             cummulative_gas_used: quantity(receipt.cummulative_gas_used),
             effective_gas_price: quantity(receipt.effective_gas_price),
-            contract_address: None,
-            logs: Vec::new(),
+            contract_address: receipt.contract_address.as_ref().map(data_address),
+            logs: receipt
+                .logs
+                .iter()
+                .map(|log| {
+                    serde_json::json!({
+                        "address": data_address(&log.address),
+                        "topics": log.topics.iter().map(data_hash).collect::<Vec<_>>(),
+                        "data": data_bytes(&log.data),
+                    })
+                })
+                .collect(),
             // A bloom filter over no logs is 256 zero bytes.
             logs_bloom: format!("0x{}", "00".repeat(256)),
             status: quantity(receipt.status),
@@ -226,5 +237,30 @@ mod tests {
         let encoded = data_address(&address);
         assert_eq!(encoded, encoded.to_lowercase());
         assert_eq!(encoded, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+    }
+
+    #[test]
+    fn receipt_response_serializes_creation_address_and_evm_logs() {
+        let contract = Address::repeat_byte(0x44);
+        let topic = B256::repeat_byte(0x55);
+        let receipt = TransactionReceipt {
+            to: None,
+            contract_address: Some(contract),
+            logs: vec![crate::node::Log {
+                address: contract,
+                topics: vec![topic],
+                data: Bytes::from_static(&[0xab, 0xcd]),
+            }],
+            status: 1,
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(TransactionReceiptResponse::from(&receipt)).unwrap();
+        assert_eq!(value["to"], serde_json::Value::Null);
+        assert_eq!(value["contractAddress"], data_address(&contract));
+        assert_eq!(value["logs"][0]["address"], data_address(&contract));
+        assert_eq!(value["logs"][0]["topics"][0], data_hash(&topic));
+        assert_eq!(value["logs"][0]["data"], "0xabcd");
+        assert_eq!(value["status"], "0x1");
     }
 }

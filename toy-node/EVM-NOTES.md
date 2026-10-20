@@ -159,3 +159,106 @@ was stopped with Ctrl-C. `cast` is not installed in this environment, so the
 README's interactive `cast mktx` workflow could not be run. The signed-transfer
 mining integration test exercises transaction admission, mining, balances, fee,
 nonce, and receipt end to end instead.
+
+## Milestone 3: contracts
+
+### Transaction representation and admission
+
+The pending transaction now retains an explicit `TxKind`: `TxKind::Create` means
+contract creation, and `TxKind::Call(address)` means a call or transfer. Creation
+is represented as `to: None` in mined transactions and JSON-RPC transaction/receipt
+objects; no zero-address sentinel is used. The pending transaction also retains
+its input bytes. The signer helpers share one legacy signing path, with dedicated
+helpers for deployment and calls.
+
+The pool accepts creation and non-empty calldata while continuing to require the
+legacy transaction type, the configured chain ID and minimum fixed gas price, a
+contiguous pending nonce, and enough pending balance for value plus the full
+upfront gas reservation. It rejects gas limits above `BLOCK_GAS_LIMIT`. Intrinsic
+gas is computed with REVM 43's Shanghai `calculate_initial_tx_gas` helper using the
+transaction's actual input and creation kind. This accounts for the 21,000 base,
+zero and non-zero calldata byte prices, creation overhead, and Shanghai initcode
+word cost. A fixed 21,000 floor would allow some underfunded creations and calls
+and ignore calldata cost, so it is no longer used for every transaction kind.
+
+### Execution, state, and receipts
+
+The executor copies the explicit transaction kind to `TxEnv.kind` and input bytes
+to `TxEnv.data`: an empty transfer has empty data, a deployment carries initcode,
+and a call carries calldata. It continues to use Shanghai, zero base fee, the
+parent hash as `prevrandao`, and an owned database snapshot. REVM's created address
+is recorded only when the result reports one; REVM's returned state commits
+deployed runtime code/code hash and storage together with balances and nonces.
+Storage slot writes are persisted through the existing `BreejaDb` commit adapter.
+
+Receipts take status from `ExecutionResult::is_success()`, gas from
+`tx_gas_used()`, and the address from `created_address()`. Successful execution
+logs are converted to Breeja logs containing emitter address, B256 topics, and raw
+data, then serialized in receipt JSON. REVM returns logs in unsuccessful result
+objects too, including logs emitted before a revert; those are discarded because
+the EVM rolls them back. Receipt logs are therefore populated only for successful
+execution. Receipt bloom remains the existing all-zero placeholder and full
+Ethereum log metadata/bloom calculation is outside this milestone.
+
+The executor distinguishes validation errors from valid EVM failures. A REVM
+transaction-validation error is skipped. A valid `REVERT` or halt returns an
+execution result, is included in the block with status `0x0`, and contributes its
+actual gas to receipt and cumulative/block gas. REVM's revert journal removes
+contract storage, code, and logs from the reverted portion while retaining valid
+sender nonce and fee effects; REVM credits the beneficiary fee once. Breeja then
+adds the separate block reward. The upfront mempool reservation remains
+`gas_limit × gas_price` plus value, while final execution charges actual gas and
+returns the unused reservation through REVM's state result.
+
+Each candidate transaction executes on a cloned snapshot, and its state is adopted
+only if its actual gas fits the block's remaining limit. Transactions that do not
+fit are left unmined for a later candidate. This keeps cumulative gas at or below
+the block limit without leaking an excluded transaction's state effects.
+
+### Milestone 3 verification and limitations
+
+New public mining tests cover the supplied deployment initcode and committed
+runtime, storage slot zero becoming 42, a single empty LOG0 with the right emitter,
+successful deployment/call receipt fields, and a reverting contract call whose
+storage and logs are discarded while gas, fee, sender nonce, miner credit, and
+supply remain correct. Pool tests cover creation/call admission, zero/non-zero
+calldata intrinsic costs, too-low and too-high gas, and continuing nonce/balance
+rejection. Receipt serialization has a test for a null `to`, a contract address,
+and EVM log contents. The existing exact 21,000-gas transfer and supply
+conservation tests remain unchanged and pass.
+
+The release node was also run with `cargo run --release -- --dev`. I queried its
+local endpoint with:
+
+```sh
+curl --max-time 5 -sS -X POST http://127.0.0.1:8545 \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+```
+
+It returned `0x16`, then `0x1e` after several seconds; Ctrl-C stopped the node
+cleanly. `cast` and `forge` are not installed, and Breeja does not
+provide a CLI for signing arbitrary creation/call transactions, so an interactive
+RPC deployment/call could not be demonstrated. The integration tests submit
+signed raw transactions through the node's public submission/mining behavior and
+inspect state/receipts, exercising deployment and calls end to end. No
+`eth_call`, `eth_estimateGas`, code/storage inspection RPC, or later milestone was
+added.
+
+All required final commands passed: `cargo fmt --all`,
+`cargo fmt --all -- --check`, `cargo test -p primitives` (17 passed),
+`cargo test -p node` (37 passed across node unit and mining integration tests),
+`cargo test -p node --test mining` (11 passed), `cargo test --workspace` (67
+passed, 0 failed), `cargo build --release`, and
+`cargo clippy --workspace --all-targets -- -D warnings`. Workspace counts were 26
+node unit tests, 11 mining tests, 17 primitives tests, and 13 JSON-RPC tests; the
+test count increased from 57 to 67. The release build first encountered a stale,
+zero-byte generated `primitives` artifact from an interrupted build; after removing
+that artifact and its fingerprint, the exact workspace release build passed. This
+was a build-cache issue, not a source or test failure.
+
+The unchanged `the_chain_never_creates_or_destroys_eth_outside_the_block_reward`
+test passed. The exact 21,000-gas transfer parity test passed. The block gas cap
+test also passes, including a valid out-of-gas execution that is charged, while the
+second transaction is excluded when it would exceed the block limit. Milestone 4
+was not started.

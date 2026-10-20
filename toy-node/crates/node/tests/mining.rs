@@ -6,7 +6,8 @@ use alloy::primitives::{Address, B256, U256};
 use node::{
     Chain, ChainConfig, miner,
     testing::{
-        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, one_eth, sign_transfer, sign_transfer_with,
+        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, one_eth, sign_contract_call,
+        sign_contract_creation, sign_transfer, sign_transfer_with,
     },
 };
 use primitives::{
@@ -84,13 +85,193 @@ fn a_signed_transfer_is_mined_and_moves_the_eth() {
     assert_eq!(state.mempool_len(), 0);
     let tx = state.get_transaction(&tx_hash).unwrap();
     assert_eq!(tx.from, alice);
-    assert_eq!(tx.to, bob);
+    assert_eq!(tx.to, Some(bob));
     assert_eq!(tx.value, one_eth() * U256::from(5u64));
 
     // The block it landed in lists it.
     let block = state.get_block_by_hash(&receipt.block_hash).unwrap();
     assert!(block.transactions.contains(&tx_hash));
     assert_eq!(block.gas_used, TRANSFER_GAS);
+}
+
+#[test]
+fn a_contract_deployment_commits_runtime_code_and_records_its_address() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let start = one_eth() * U256::from(100u64);
+    let chain = test_chain(&[(alice, start)]);
+    let initcode = alloy::primitives::Bytes::from_static(&[
+        0x60, 0x0b, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0b, 0x60, 0x00, 0xf3, 0x60, 0x2a, 0x60,
+        0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00,
+    ]);
+    let raw = sign_contract_creation(DEV_PRIVATE_KEY, U256::ZERO, 0, 200_000, initcode).unwrap();
+    let tx_hash = chain.submit_raw_transaction(&raw).unwrap();
+    let handle = miner::spawn(chain.clone());
+
+    wait_for(Duration::from_secs(10), "contract deployment", || {
+        chain.read().get_receipt(&tx_hash).is_some()
+    });
+    chain.shutdown();
+    handle.join().unwrap();
+
+    let state = chain.read();
+    let receipt = state.get_receipt(&tx_hash).unwrap();
+    let address = receipt
+        .contract_address
+        .expect("successful deployment records its address");
+    assert_eq!(receipt.status, 1);
+    assert_eq!(
+        state.get_code(&address).unwrap().as_ref(),
+        [
+            0x60, 0x2a, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00,
+        ]
+    );
+    assert_eq!(state.get_account(&alice).nonce, 1);
+    assert!(
+        (50_000..60_000).contains(&receipt.gas_used),
+        "unexpected deployment gas: {}",
+        receipt.gas_used
+    );
+    let block = state.get_block(receipt.block_number).unwrap();
+    assert_eq!(block.gas_used, receipt.cummulative_gas_used);
+    assert!(block.gas_used >= receipt.gas_used);
+}
+
+#[test]
+fn a_contract_call_commits_storage_and_includes_its_log() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let start = one_eth() * U256::from(100u64);
+    let chain = test_chain(&[(alice, start)]);
+    let initcode = alloy::primitives::Bytes::from_static(&[
+        0x60, 0x0b, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0b, 0x60, 0x00, 0xf3, 0x60, 0x2a, 0x60,
+        0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00,
+    ]);
+    let deploy = sign_contract_creation(DEV_PRIVATE_KEY, U256::ZERO, 0, 200_000, initcode).unwrap();
+    let deployment_hash = chain.submit_raw_transaction(&deploy).unwrap();
+    let handle = miner::spawn(chain.clone());
+
+    wait_for(Duration::from_secs(10), "contract deployment", || {
+        chain.read().get_receipt(&deployment_hash).is_some()
+    });
+    let address = chain
+        .read()
+        .get_receipt(&deployment_hash)
+        .unwrap()
+        .contract_address
+        .unwrap();
+    // The provided runtime ignores calldata while writing slot zero and emitting LOG0.
+    let call = sign_contract_call(
+        DEV_PRIVATE_KEY,
+        address,
+        U256::ZERO,
+        1,
+        100_000,
+        alloy::primitives::Bytes::from_static(&[0x12, 0x34]),
+    )
+    .unwrap();
+    let call_hash = chain.submit_raw_transaction(&call).unwrap();
+    wait_for(Duration::from_secs(10), "contract call", || {
+        chain.read().get_receipt(&call_hash).is_some()
+    });
+    chain.shutdown();
+    handle.join().unwrap();
+
+    let state = chain.read();
+    let receipt = state.get_receipt(&call_hash).unwrap();
+    assert_eq!(receipt.status, 1);
+    assert_eq!(receipt.contract_address, None);
+    assert_eq!(state.get_storage(&address, &U256::ZERO), U256::from(42));
+    assert_eq!(state.get_account(&alice).nonce, 2);
+    assert!((43_000..45_000).contains(&receipt.gas_used));
+    assert_eq!(receipt.logs.len(), 1);
+    assert_eq!(receipt.logs[0].address, address);
+    assert!(receipt.logs[0].topics.is_empty());
+    assert!(receipt.logs[0].data.is_empty());
+    let block = state.get_block(receipt.block_number).unwrap();
+    assert_eq!(block.gas_used, receipt.cummulative_gas_used);
+}
+
+#[test]
+fn a_reverting_call_is_mined_charged_and_does_not_commit_storage_or_logs() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let start = one_eth() * U256::from(100u64);
+    let chain = test_chain(&[(alice, start)]);
+    // Store 42, emit LOG0, then revert. Neither the storage nor the log survives.
+    let initcode = alloy::primitives::Bytes::from_static(&[
+        0x60, 0x0f, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0f, 0x60, 0x00, 0xf3, 0x60, 0x2a, 0x60,
+        0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x60, 0x00, 0x60, 0x00, 0xfd,
+    ]);
+    let deploy = sign_contract_creation(DEV_PRIVATE_KEY, U256::ZERO, 0, 200_000, initcode).unwrap();
+    let deployment_hash = chain.submit_raw_transaction(&deploy).unwrap();
+    let handle = miner::spawn(chain.clone());
+
+    wait_for(
+        Duration::from_secs(10),
+        "revert-contract deployment",
+        || chain.read().get_receipt(&deployment_hash).is_some(),
+    );
+    let address = chain
+        .read()
+        .get_receipt(&deployment_hash)
+        .unwrap()
+        .contract_address
+        .unwrap();
+    let balance_before_call = chain.read().get_account(&alice).balance;
+    let initial_slot = chain.read().get_storage(&address, &U256::ZERO);
+    let call = sign_contract_call(
+        DEV_PRIVATE_KEY,
+        address,
+        U256::ZERO,
+        1,
+        100_000,
+        alloy::primitives::Bytes::new(),
+    )
+    .unwrap();
+    let call_hash = chain.submit_raw_transaction(&call).unwrap();
+    wait_for(Duration::from_secs(10), "reverting call", || {
+        chain.read().get_receipt(&call_hash).is_some()
+    });
+    chain.shutdown();
+    handle.join().unwrap();
+
+    let state = chain.read();
+    let receipt = state.get_receipt(&call_hash).unwrap();
+    assert_eq!(receipt.status, 0);
+    assert!(receipt.gas_used > TRANSFER_GAS);
+    assert!(receipt.contract_address.is_none());
+    assert!(receipt.logs.is_empty(), "reverted logs must be discarded");
+    assert_eq!(state.get_storage(&address, &U256::ZERO), initial_slot);
+    assert_eq!(state.get_account(&alice).nonce, 2);
+    assert_eq!(
+        balance_before_call - state.get_account(&alice).balance,
+        U256::from(receipt.gas_used) * U256::from(GAS_PRICE)
+    );
+
+    let miner = chain.config().miner;
+    let paid_fees = state
+        .get_receipt(&deployment_hash)
+        .unwrap()
+        .gas_used
+        .checked_add(receipt.gas_used)
+        .unwrap();
+    let blocks = state.get_block_number();
+    assert_eq!(
+        state.get_account(&miner).balance,
+        primitives::constants::BLOCK_REWARD * U256::from(blocks)
+            + U256::from(paid_fees) * U256::from(GAS_PRICE)
+    );
+    let block = state.get_block(receipt.block_number).unwrap();
+    assert!(block.transactions.contains(&call_hash));
+    assert_eq!(block.gas_used, receipt.cummulative_gas_used);
+
+    let total: U256 = state
+        .accounts_snapshot()
+        .values()
+        .map(|account| account.balance)
+        .sum();
+    assert_eq!(
+        total,
+        start + primitives::constants::BLOCK_REWARD * U256::from(blocks)
+    );
 }
 
 #[test]

@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use primitives::{
     constants::{BLOCK_GAS_LIMIT, BLOCK_REWARD, CHAIN_ID},
-    node::{Account, Block, PendingTransaction, Transaction, TransactionReceipt, hash_list_root},
+    node::{
+        Account, Block, Log, PendingTransaction, Transaction, TransactionReceipt, hash_list_root,
+    },
 };
 use revm::{
     Context, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext,
@@ -28,7 +30,7 @@ pub struct Execution {
     pub state_root: B256,
 }
 
-/// Executes one pending plain ETH transfer through REVM and commits its changes
+/// Executes one pending legacy transaction through REVM and commits its changes
 /// into the owned database snapshot.
 pub fn execute_transaction(
     db: &mut BreejaDb,
@@ -41,9 +43,9 @@ pub fn execute_transaction(
         caller: tx.from,
         gas_limit: tx.gas,
         gas_price: tx.gas_price,
-        kind: TxKind::Call(tx.to),
+        kind: tx.to,
         value: tx.value,
-        data: Bytes::new(),
+        data: tx.input.clone(),
         nonce: tx.nonce,
         chain_id: Some(tx.chain_id),
         ..Default::default()
@@ -61,10 +63,8 @@ pub fn execute_transaction(
     let changes = outcome.state;
     drop(evm);
 
-    if !result.is_success() {
-        anyhow::bail!("REVM did not successfully execute plain transfer: {result:?}");
-    }
-
+    // REVM finalizes valid reverts and halts with only fee/nonce changes left in
+    // its state. Commit that state too: invalid transactions instead return Err.
     db.commit(changes);
     Ok(result)
 }
@@ -82,7 +82,7 @@ fn pay_block_reward(
     Ok(())
 }
 
-/// Executes a batch of pending transfers, producing the state and receipts the
+/// Executes a batch of pending transactions, producing the state and receipts the
 /// next block will commit to. Transactions REVM rejects as invalid are skipped.
 pub fn execute_block(
     mut db: BreejaDb,
@@ -108,11 +108,38 @@ pub fn execute_block(
     let mut gas_used = 0u64;
 
     for tx in batch {
-        match execute_transaction(&mut db, tx, block_env.clone()) {
+        // Execute against a throwaway copy so a transaction that would exceed
+        // the remaining block gas cannot leak state changes into this candidate.
+        let mut candidate_db = db.clone();
+        match execute_transaction(&mut candidate_db, tx, block_env.clone()) {
             Ok(result) => {
                 let tx_gas = result.tx_gas_used();
+                if gas_used.saturating_add(tx_gas) > BLOCK_GAS_LIMIT {
+                    continue;
+                }
+                db = candidate_db;
                 let index = transactions.len() as u64;
                 gas_used += tx_gas;
+                let success = result.is_success();
+                let logs = if success {
+                    result
+                        .logs()
+                        .iter()
+                        .map(|log| Log {
+                            address: log.address,
+                            topics: log.data.topics().to_vec(),
+                            data: log.data.data.clone(),
+                        })
+                        .collect()
+                } else {
+                    // REVM exposes logs produced before a revert in its result;
+                    // Ethereum receipts contain no logs for reverted execution.
+                    Vec::new()
+                };
+                let recipient = match tx.to {
+                    TxKind::Call(address) => Some(address),
+                    TxKind::Create => None,
+                };
 
                 transactions.push(Transaction {
                     hash: tx.hash,
@@ -123,12 +150,12 @@ pub fn execute_block(
                     transaction_index: index,
                     chain_id: tx.chain_id,
                     from: tx.from,
-                    to: tx.to,
+                    to: recipient,
                     value: tx.value,
                     nonce: tx.nonce,
                     gas: tx.gas,
                     gas_price: tx.gas_price,
-                    input: Bytes::new(),
+                    input: tx.input.clone(),
                     v: tx.v,
                     r: tx.r,
                     s: tx.s,
@@ -140,11 +167,13 @@ pub fn execute_block(
                     block_hash: B256::ZERO,
                     block_number,
                     from: tx.from,
-                    to: tx.to,
+                    to: recipient,
+                    contract_address: result.created_address(),
+                    logs,
                     gas_used: tx_gas,
                     cummulative_gas_used: gas_used,
                     effective_gas_price: tx.gas_price,
-                    status: u8::from(result.is_success()),
+                    status: u8::from(success),
                 });
             }
             Err(error) => {
@@ -199,7 +228,8 @@ mod tests {
         PendingTransaction {
             hash: B256::repeat_byte(0xab),
             from: DEV_ADDRESS,
-            to: DEV_ADDRESS_1,
+            to: TxKind::Call(DEV_ADDRESS_1),
+            input: Bytes::new(),
             value,
             nonce,
             gas: TRANSFER_GAS,
@@ -366,5 +396,58 @@ mod tests {
             Address::repeat_byte(0x99),
         );
         assert_eq!(execution.transactions.len(), 1);
+    }
+
+    #[test]
+    fn a_batch_never_commits_or_counts_transactions_over_the_block_gas_limit() {
+        let miner = Address::repeat_byte(0x99);
+        let contract = Address::repeat_byte(0x88);
+        let sender_balance = U256::from(BLOCK_GAS_LIMIT) * U256::from(2u64);
+        let loop_code = revm::state::Bytecode::new_raw(Bytes::from_static(&[
+            0x5b, // JUMPDEST
+            0x60, 0x00, // PUSH1 0
+            0x56, // JUMP
+        ]));
+        let code_hash = loop_code.hash_slow();
+        let mut db = funded(sender_balance);
+        db.accounts.insert(
+            contract,
+            Account {
+                code_hash,
+                ..Default::default()
+            },
+        );
+        db.code_by_hash.insert(code_hash, loop_code);
+
+        let gas = BLOCK_GAS_LIMIT / 2 + 100_000;
+        let make_call = |nonce, hash_byte| PendingTransaction {
+            hash: B256::repeat_byte(hash_byte),
+            from: DEV_ADDRESS,
+            to: TxKind::Call(contract),
+            input: Bytes::new(),
+            value: U256::ZERO,
+            nonce,
+            gas,
+            gas_price: 1,
+            chain_id: CHAIN_ID,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+        let execution = execute_block(
+            db,
+            &[make_call(0, 0xaa), make_call(1, 0xbb)],
+            &parent(),
+            1,
+            2,
+            4,
+            miner,
+        );
+
+        assert_eq!(execution.transactions.len(), 1);
+        assert_eq!(execution.receipts[0].status, 0);
+        assert_eq!(execution.gas_used, gas);
+        assert!(execution.gas_used <= BLOCK_GAS_LIMIT);
+        assert_eq!(execution.accounts[&DEV_ADDRESS].nonce, 1);
     }
 }
