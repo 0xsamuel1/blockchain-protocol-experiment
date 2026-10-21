@@ -37,19 +37,8 @@ pub fn execute_transaction(
     tx: &PendingTransaction,
     block: BlockEnv,
 ) -> Result<ExecutionResult, anyhow::Error> {
-    let cfg = CfgEnv::new_with_spec(SpecId::SHANGHAI).with_chain_id(CHAIN_ID);
-    let tx_env = TxEnv {
-        tx_type: 0,
-        caller: tx.from,
-        gas_limit: tx.gas,
-        gas_price: tx.gas_price,
-        kind: tx.to,
-        value: tx.value,
-        data: tx.input.clone(),
-        nonce: tx.nonce,
-        chain_id: Some(tx.chain_id),
-        ..Default::default()
-    };
+    let cfg = execution_cfg();
+    let tx_env = pending_tx_env(tx);
 
     let mut evm = Context::mainnet()
         .with_db(&mut *db)
@@ -68,6 +57,71 @@ pub fn execute_transaction(
     db.commit(changes);
     Ok(result)
 }
+
+/// Builds the shared Shanghai configuration used for mined and simulated work.
+pub fn execution_cfg() -> CfgEnv<SpecId> {
+    CfgEnv::new_with_spec(SpecId::SHANGHAI).with_chain_id(CHAIN_ID)
+}
+
+/// Maps Breeja's transaction fields into the REVM transaction environment.
+pub fn pending_tx_env(tx: &PendingTransaction) -> TxEnv {
+    TxEnv {
+        tx_type: 0,
+        caller: tx.from,
+        gas_limit: tx.gas,
+        gas_price: tx.gas_price,
+        kind: tx.to,
+        value: tx.value,
+        data: tx.input.clone(),
+        nonce: tx.nonce,
+        chain_id: Some(tx.chain_id),
+        ..Default::default()
+    }
+}
+
+/// Runs an eth_call / estimate probe against an owned snapshot. REVM returns
+/// the state changes, but this function deliberately drops them with the DB.
+pub fn simulate_transaction(
+    mut db: BreejaDb,
+    cfg: CfgEnv<SpecId>,
+    tx_env: TxEnv,
+    block: BlockEnv,
+) -> Result<ExecutionResult, SimulationError> {
+    let mut evm = Context::mainnet()
+        .with_db(&mut db)
+        .with_block(block)
+        .with_cfg(cfg)
+        .build_mainnet();
+    let outcome = evm.transact(tx_env).map_err(|error| match error {
+        revm::context_interface::result::EVMError::Transaction(error) => {
+            SimulationError::Invalid(error.to_string())
+        }
+        revm::context_interface::result::EVMError::Header(error) => {
+            SimulationError::Invalid(error.to_string())
+        }
+        other => SimulationError::Internal(format!("REVM simulation error: {other:?}")),
+    })?;
+    // Do not call DatabaseCommit: both successful and failed simulations are
+    // read-only from Breeja's point of view.
+    Ok(outcome.result)
+}
+
+#[derive(Debug)]
+pub enum SimulationError {
+    Invalid(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for SimulationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(f, "invalid EVM transaction: {message}"),
+            Self::Internal(message) => write!(f, "internal EVM error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for SimulationError {}
 
 /// Pays the miner for sealing a block.
 ///

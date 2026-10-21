@@ -1,15 +1,25 @@
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use jsonrpsee::{
     core::RpcResult,
     types::{ErrorObjectOwned, Params, error::ErrorCode},
 };
+use node::{
+    evm::BreejaDb,
+    executor::{SimulationError, execution_cfg, simulate_transaction},
+    pool::intrinsic_gas,
+};
 use primitives::{
-    constants::{CHAIN_ID, GAS_PRICE, TRANSFER_GAS},
+    constants::{BLOCK_GAS_LIMIT, CHAIN_ID, GAS_PRICE},
     node::BlockState,
     params::{BlockTag, CallRequest},
     response::{
         BlockResponse, TransactionReceiptResponse, TransactionResponse, data_hash, quantity,
     },
+};
+use revm::{
+    context::{BlockEnv, CfgEnv, TxEnv},
+    context_interface::result::ExecutionResult,
+    primitives::hardfork::SpecId,
 };
 use serde_json::Value;
 
@@ -22,15 +32,6 @@ const INVALID_INPUT: i32 = -32000;
 /// Turns an internal error into a JSON-RPC error object the client can read.
 fn invalid_input(error: impl std::fmt::Display) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(INVALID_INPUT, error.to_string(), None::<()>)
-}
-
-/// Error returned when a request needs the EVM this node does not have.
-fn no_evm(detail: &str) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(
-        INVALID_INPUT,
-        format!("this node has no EVM and only processes ETH transfers: {detail}"),
-        None::<()>,
-    )
 }
 
 fn invalid_params(error: impl std::fmt::Display) -> ErrorObjectOwned {
@@ -222,66 +223,194 @@ pub fn send_raw_transaction_handler(params: Params<'_>, context: &RPCContext) ->
     Ok(data_hash(&hash))
 }
 
-/// Executes a read-only call.
-///
-/// On Ethereum this runs the EVM against current state and discards the result.
-/// Breeja has no EVM, so there are only two possible answers: a call with no
-/// calldata invokes no code and returns no data (`0x`), and a call *with* calldata
-/// is refused, because answering it honestly would require the interpreter this
-/// node omits.
+struct PreparedCall {
+    db: BreejaDb,
+    block: BlockEnv,
+    cfg: CfgEnv<SpecId>,
+    base_tx: TxEnv,
+    intrinsic: u64,
+    requested_gas: Option<u64>,
+}
+
+fn prepare_call(
+    request: CallRequest,
+    tag: Option<BlockTag>,
+    context: &RPCContext,
+) -> Result<PreparedCall, ErrorObjectOwned> {
+    let input = match (&request.data, &request.input) {
+        (Some(data), Some(input)) if data != input => {
+            return Err(invalid_params("data and input fields disagree"));
+        }
+        (Some(data), _) => data.clone(),
+        (_, Some(input)) => input.clone(),
+        _ => Bytes::new(),
+    };
+    let gas = request
+        .gas
+        .map(|gas| u64::try_from(gas).map_err(|_| invalid_params("gas exceeds u64")))
+        .transpose()?;
+    if gas.is_some_and(|gas| gas > BLOCK_GAS_LIMIT) {
+        return Err(invalid_params(format!(
+            "gas exceeds Breeja's block gas limit ({BLOCK_GAS_LIMIT})"
+        )));
+    }
+    let gas_price = request
+        .gas_price
+        .map(|price| u128::try_from(price).map_err(|_| invalid_params("gasPrice exceeds u128")))
+        .transpose()?
+        .unwrap_or(GAS_PRICE);
+    let value = request.value.unwrap_or(U256::ZERO);
+    let to = request.to.map(TxKind::Call).unwrap_or(TxKind::Create);
+    let intrinsic = intrinsic_gas(to, &input);
+
+    let state = context.chain.read();
+    let head = state
+        .get_block(state.get_block_number())
+        .expect("head block exists");
+    let number = tag
+        .as_ref()
+        .map(|tag| resolve_tag(&state, tag))
+        .transpose()?
+        .unwrap_or(head.number);
+    if number != head.number {
+        return Err(invalid_input(
+            "historical EVM snapshots are unavailable; use the current block",
+        ));
+    }
+    let caller = request.from.unwrap_or(Address::ZERO);
+    let nonce = state
+        .get_account_at(&caller, head.number)
+        .map(|account| account.nonce)
+        .unwrap_or(0);
+    let db = BreejaDb::from_state(&state);
+    let block = BlockEnv {
+        number: U256::from(head.number),
+        beneficiary: context.chain.config().miner,
+        timestamp: U256::from(head.timestamp),
+        gas_limit: BLOCK_GAS_LIMIT,
+        basefee: 0,
+        difficulty: U256::from(head.difficulty),
+        prevrandao: Some(head.hash),
+        ..Default::default()
+    };
+    drop(state);
+
+    let mut cfg = execution_cfg();
+    // Calls ignore sender nonce and upfront balance requirements; their state is discarded.
+    cfg.disable_nonce_check = true;
+    cfg.disable_balance_check = true;
+    let base_tx = TxEnv {
+        tx_type: 0,
+        caller,
+        gas_limit: gas.unwrap_or(BLOCK_GAS_LIMIT),
+        gas_price,
+        kind: to,
+        value,
+        data: input,
+        nonce,
+        chain_id: Some(CHAIN_ID),
+        ..Default::default()
+    };
+    Ok(PreparedCall {
+        db,
+        block,
+        cfg,
+        base_tx,
+        intrinsic,
+        requested_gas: gas,
+    })
+}
+
+fn simulate(prepared: &PreparedCall, gas: u64) -> Result<ExecutionResult, SimulationError> {
+    let mut tx = prepared.base_tx.clone();
+    tx.gas_limit = gas;
+    simulate_transaction(
+        prepared.db.clone(),
+        prepared.cfg.clone(),
+        tx,
+        prepared.block.clone(),
+    )
+}
+
+fn execution_error(result: ExecutionResult) -> ErrorObjectOwned {
+    match result {
+        ExecutionResult::Revert { output, .. } => ErrorObjectOwned::owned(
+            INVALID_INPUT,
+            "execution reverted",
+            Some(Value::String(format!("0x{}", alloy::hex::encode(output)))),
+        ),
+        ExecutionResult::Halt { reason, .. } => {
+            invalid_input(format!("execution halted: {reason}"))
+        }
+        ExecutionResult::Success { .. } => unreachable!("success is not an error"),
+    }
+}
+
+fn simulation_error(error: SimulationError) -> ErrorObjectOwned {
+    match error {
+        SimulationError::Invalid(message) => invalid_input(message),
+        SimulationError::Internal(message) => {
+            tracing::error!(%message, "EVM simulation failed internally");
+            ErrorObjectOwned::owned(
+                ErrorCode::InternalError.code(),
+                "internal EVM simulation error",
+                None::<()>,
+            )
+        }
+    }
+}
+
+/// Executes a read-only call against the current chain snapshot.
 pub fn call_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
     let mut sequence = params.sequence();
     let request: CallRequest = sequence.next()?;
     let tag = sequence.optional_next::<BlockTag>()?;
-
-    // Validate the block tag even though the answer does not depend on state, so
-    // a caller asking about a nonexistent block gets told.
-    if let Some(tag) = tag {
-        resolve_tag(&context.chain.read(), &tag)?;
+    let prepared = prepare_call(request, tag, context)?;
+    let gas = prepared.requested_gas.unwrap_or(BLOCK_GAS_LIMIT);
+    if gas < prepared.intrinsic {
+        return Err(invalid_input(format!(
+            "gas {gas} is below intrinsic gas ({})",
+            prepared.intrinsic
+        )));
     }
-
-    if request.needs_evm() {
-        return Err(no_evm(
-            "eth_call can only be answered for plain transfers, which return no data",
-        ));
+    match simulate(&prepared, gas).map_err(simulation_error)? {
+        ExecutionResult::Success { output, .. } => {
+            Ok(format!("0x{}", alloy::hex::encode(output.data())))
+        }
+        result => Err(execution_error(result)),
     }
-
-    Ok("0x".to_owned())
 }
 
-/// Estimates the gas a transaction would need.
-///
-/// Without an EVM there is exactly one kind of transaction to estimate, and its
-/// cost is a constant: 21,000 gas, the intrinsic cost of a transfer. Anything
-/// carrying calldata would need to be executed to be estimated, so it is refused.
+/// Finds the least successful gas limit with independent snapshot probes.
 pub fn estimate_gas_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
     let mut sequence = params.sequence();
     let request: CallRequest = sequence.next()?;
     let tag = sequence.optional_next::<BlockTag>()?;
-
-    if let Some(tag) = tag {
-        resolve_tag(&context.chain.read(), &tag)?;
+    let prepared = prepare_call(request, tag, context)?;
+    let upper = prepared.requested_gas.unwrap_or(BLOCK_GAS_LIMIT);
+    if prepared.intrinsic > upper {
+        return Err(invalid_input(format!(
+            "gas limit {upper} is below intrinsic gas ({})",
+            prepared.intrinsic
+        )));
     }
-
-    if request.needs_evm() {
-        return Err(no_evm(
-            "eth_estimateGas can only be answered for plain transfers, which always cost 21000 gas",
-        ));
+    match simulate(&prepared, upper).map_err(simulation_error)? {
+        ExecutionResult::Success { .. } => (),
+        result => return Err(execution_error(result)),
     }
-
-    // A transfer the sender cannot afford would never be mined, so estimating it
-    // is a client bug worth surfacing.
-    if let Some(from) = request.from {
-        let value = request.value.unwrap_or(U256::ZERO);
-        let fee = U256::from(TRANSFER_GAS) * U256::from(GAS_PRICE);
-        let available = context.chain.read().get_pending_balance(&from);
-        if available < value + fee {
-            return Err(invalid_input(format!(
-                "insufficient funds: {from} has {available} but the transfer needs {}",
-                value + fee
-            )));
+    let (mut low, mut high) = (prepared.intrinsic, upper);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match simulate(&prepared, mid).map_err(simulation_error)? {
+            ExecutionResult::Success { .. } => high = mid,
+            ExecutionResult::Revert { .. } | ExecutionResult::Halt { .. } => low = mid + 1,
         }
     }
-
-    Ok(quantity(TRANSFER_GAS))
+    // GAS-dependent bytecode makes this heuristic; verify the final bound and
+    // use the proven successful cap if the minimum unexpectedly fails.
+    let estimate = match simulate(&prepared, low).map_err(simulation_error)? {
+        ExecutionResult::Success { .. } => low,
+        ExecutionResult::Revert { .. } | ExecutionResult::Halt { .. } => upper,
+    };
+    Ok(quantity(estimate))
 }

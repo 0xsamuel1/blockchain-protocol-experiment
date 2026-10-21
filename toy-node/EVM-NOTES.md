@@ -260,5 +260,138 @@ was a build-cache issue, not a source or test failure.
 The unchanged `the_chain_never_creates_or_destroys_eth_outside_the_block_reward`
 test passed. The exact 21,000-gas transfer parity test passed. The block gas cap
 test also passes, including a valid out-of-gas execution that is charged, while the
-second transaction is excluded when it would exceed the block limit. Milestone 4
-was not started.
+second transaction is excluded when it would exceed the block limit.
+
+## Milestone 4: read-only calls and gas estimation
+
+### Execution and request handling
+
+The existing JSON-RPC routes now run requests through REVM 43.0.3. `eth_call`
+translates `from`, `to`/creation, `value`, `gas`, `gasPrice`, and `data`/`input`
+into a Shanghai `TxEnv`. Omitted callers default to the zero address, omitted value
+to zero, gas to Breeja's block limit, gas price to the node's fixed price, and nonce
+to the caller's current account nonce. Supplying both `data` and `input` is accepted
+only when the bytes match. Integer conversions are checked, and requests above the
+block gas limit or below transaction intrinsic gas are rejected.
+
+The simulation copies accounts, code, and block hashes into an owned `BreejaDb`
+snapshot, releases the chain read lock, executes, and drops the snapshot without
+calling `DatabaseCommit`. Successful calls return REVM's output bytes. Reverts and
+halts return JSON-RPC execution errors; revert errors carry the returned revert data.
+The simulation config disables REVM's nonce and upfront-balance checks, as these
+are commonly relaxed for `eth_call` and the resulting state is never committed.
+Other transaction and block constraints remain active. Calls still use the current
+head's block context, including zero base fee and the configured miner beneficiary.
+
+Breeja retains historical account snapshots, but it does not retain matching
+historical code/storage snapshots for REVM. Therefore EVM simulation supports the
+current head (`latest`, `pending`, `safe`, and `finalized` resolve there) and rejects
+older block requests with a clear error rather than using current contract state for
+an old block. `pending` simulation currently means the current committed state; it
+does not replay unmined transactions.
+
+### Gas estimation
+
+`eth_estimateGas` computes Shanghai intrinsic gas using the same REVM helper as
+mempool validation. It first executes at the request gas limit or block gas limit;
+if that execution reverts or halts, estimation returns an execution error. It then
+binary-searches from intrinsic gas to that successful upper bound. Every probe
+clones the same base `BreejaDb`, so one probe cannot influence another. The final
+candidate is executed once more and returned if successful; if GAS-dependent code
+makes the candidate fail, the already-proven upper bound is returned. This is a
+heuristic rather than a proof because contracts may branch on `GAS`. No blanket
+safety margin is added; callers receive the lowest verified successful candidate
+under the search's behavior, or the verified cap for a non-monotonic final result.
+
+### Milestone 4 verification
+
+Baseline before changes: the clean `feat/evm` Milestone 3 commit was `fe3aed8`; all
+67 workspace tests passed, formatting, release build, and Clippy passed. The initial
+RPC integration run added call-output, read-only storage, revert, gas search, and
+contract transaction tests. It found and corrected a five-byte REVERT test runtime
+that had mistakenly declared a four-byte length. The focused corrected revert test
+passed. A first complete run also exposed an assertion race with the background
+miner creating unrelated empty blocks. The state-isolation test now stops and joins
+the miner before comparing block height; the focused test and subsequent full run
+passed.
+
+The RPC integration tests now cover `eth_call` output bytes, data/input alias
+handling, revert errors, calldata acceptance, unchanged contract storage, sender
+balance/nonce and block height after a simulated write, historical-state rejection,
+exact `0x5208` transfer estimation, and a mined contract call using exactly the
+estimated gas. The test uses the normal signed-transaction submission, miner, and
+receipt interfaces. No code/storage/log RPC queries or other Milestone 5 methods were added.
+
+
+Final tests, release build, and Clippy passed: `cargo test -p primitives` (17
+passed), `cargo test -p node` (37 passed across unit and mining tests),
+`cargo test -p node --test mining` (11 passed), `cargo test -p rpc` (15 passed),
+`cargo test --workspace` (69 passed, 0 failed), `cargo build --release`, and
+`cargo clippy --workspace --all-targets -- -D warnings`. The workspace formatting
+check passed while excluding the unrelated empty example described below. On the
+final worktree, `cargo fmt --all -- --check` reports formatting for the pre-existing
+untracked, zero-byte `crates/node/examples/m4_sign.rs`. I preserved that file
+unchanged rather than editing unrelated user data. No tests were removed or ignored.
+The test count increased from 67 to 69. The unchanged supply-conservation and exact
+21,000-gas transfer tests passed.
+
+The release node was run with `cargo run --release -- --dev` outside the socket-
+restricted sandbox and stopped with Ctrl-C after these checks. Its block number
+advanced from `0x13` to `0x15` over three seconds. The commands below were sent to
+`http://127.0.0.1:8545` while the node was running:
+
+```sh
+# Plain transfer estimate
+curl -sS -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","method":"eth_estimateGas","params":[{"to":"0x0000000000000000000000000000000000000022"}],"id":1}'
+# result: 0x5208
+
+# eth_call against the deployed counter (the signed creation transaction was
+# submitted with eth_sendRawTransaction; receipt address: 0x5fbdb2315678afecb367f032d93f642f64180aa3)
+curl -sS -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"0x5fbdb2315678afecb367f032d93f642f64180aa3"},"latest"],"id":2}'
+# result: 0x0000000000000000000000000000000000000000000000000000000000000001
+# Repeating the same eth_call returned the same value (1), demonstrating that
+# the counter's simulated SSTORE did not persist.
+
+# Estimate the state-changing counter call
+curl -sS -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","method":"eth_estimateGas","params":[{"from":"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","to":"0x5fbdb2315678afecb367f032d93f642f64180aa3"}],"id":3}'
+# result: 0xa87a (43,130 gas)
+```
+
+The signed counter deployment and call were submitted with these exact raw
+transactions; the call used nonce 1 and gas limit exactly `0xa87a`:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xf86e80843b9aca00830249f080809e6012600c60003960126000f36000546001018060005560005260206000f326a079fd6ebe870f0584995d7646d64d3f02a88a744406cf52d9f8b743d1b6e44d5fa05857ee2307cc83e504091182157695fc35e6139b3ab9921d7f4661f6e7820aed"],"id":10}'
+# deployment tx: 0xdd203fd2e7dfcdabf7435beea1284f5567059e8dedbd53ca3ab51dd60e2eabd8
+
+curl -sS -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xf86201843b9aca0082a87a945fbdb2315678afecb367f032d93f642f64180aa3808025a0386dfd25396022e61ee2f31ce7a00d5c89a2d31798b2492fcd947c49266a0eb49f8519b3c55cf4eedeae80e525faf544b518de487fc5ef5379375a02e4db9247"],"id":15}'
+# mined call tx: 0xcbde4cf451f8947666cd0b2c14b40bf938dbb6e97dd825f42b16a039256d2377
+```
+
+The call receipt had status `0x1` and `gasUsed` `0xa87a`. A subsequent `eth_call`
+returned the 32-byte value 2: the mined call changed the counter once, while
+preceding simulations left it unchanged.
+
+A second signed creation transaction deployed a five-byte REVERT runtime at
+`0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0`:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xf86102843b9aca00830186a08080916005600c60003960056000f360006000fd26a019c297e776e8cd37cd76a6f0b5d359302637da8c7091f24774f7b021836b9823a01570d21bf3ed1bfb0de82d94bee2d6c9b0848611d642705430adce6e2b632462"],"id":21}'
+# revert contract tx: 0xfd57898eac45cb4f536a559b043ae3c9db55c7abafe34883cb936d250d1ca531
+```
+
+Calling it produced:
+
+```json
+{"jsonrpc":"2.0","id":4,"error":{"code":-32000,"message":"execution reverted","data":"0x"}}
+```
+
+The same integration tests exercise deployment, call output, storage neutrality,
+revert errors, and exactly-estimated mined execution through the RPC server. No
+contract-inspection methods were added, and Milestone 5 was not started.

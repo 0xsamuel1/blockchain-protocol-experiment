@@ -99,7 +99,7 @@ fn decode_and_check(raw: &Bytes) -> Result<DecodedTransaction, anyhow::Error> {
 
 /// Shanghai intrinsic gas for this legacy call or creation, including calldata
 /// zero/non-zero byte costs, creation overhead, and initcode word cost.
-fn intrinsic_gas(to: TxKind, input: &Bytes) -> u64 {
+pub fn intrinsic_gas(to: TxKind, input: &Bytes) -> u64 {
     calculate_initial_tx_gas(
         SpecId::SHANGHAI,
         input,

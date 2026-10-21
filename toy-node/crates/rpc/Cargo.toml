@@ -13,6 +13,7 @@ node.workspace = true
 alloy.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+revm = "43.0.3"
 
 [dev-dependencies]
 jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
