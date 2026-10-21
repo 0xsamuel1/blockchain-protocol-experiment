@@ -163,8 +163,8 @@ Deliberately Frontier-era, in `crates/primitives/src/constants.rs`:
 | --- | --- | --- |
 | Chain ID | 1 | |
 | Gas price | 1 gwei, fixed | No fee market; no EIP-1559 |
-| Transfer cost | 21,000 gas | The only cost there is |
-| Block gas limit | 3,141,592 | Frontier's "pi million" — 149 transfers per block |
+| Transfer cost | 21,000 gas | Base intrinsic cost; calldata and creation add gas |
+| Block gas limit | 3,141,592 | Frontier's "pi million"; enforced using actual cumulative gas |
 | Block reward | 5 ETH | As on Frontier and Homestead |
 | Target block time | 15s (2s with `--dev`) | |
 

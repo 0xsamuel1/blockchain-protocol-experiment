@@ -841,6 +841,11 @@ async fn contract_inspection_methods_return_code_storage_logs_and_gas_price() {
         .request("eth_getTransactionReceipt", rpc_params![call_hash.clone()])
         .await
         .unwrap();
+    assert_ne!(
+        call_receipt["logsBloom"],
+        format!("0x{}", "00".repeat(256)),
+        "a receipt containing a log must expose a non-zero bloom"
+    );
     let call_block = call_receipt["blockNumber"].as_str().unwrap();
 
     let slot: String = harness

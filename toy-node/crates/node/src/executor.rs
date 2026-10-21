@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_never_commits_or_counts_transactions_over_the_block_gas_limit() {
+    fn a_batch_with_varying_gas_never_exceeds_the_block_gas_limit() {
         let miner = Address::repeat_byte(0x99);
         let contract = Address::repeat_byte(0x88);
         let sender_balance = U256::from(BLOCK_GAS_LIMIT) * U256::from(2u64);
@@ -464,6 +464,8 @@ mod tests {
         ]));
         let code_hash = loop_code.hash_slow();
         let mut db = funded(sender_balance);
+        db.accounts
+            .insert(DEV_ADDRESS_1, Account::new(sender_balance));
         db.accounts.insert(
             contract,
             Account {
@@ -473,14 +475,15 @@ mod tests {
         );
         db.code_by_hash.insert(code_hash, loop_code);
 
-        let gas = BLOCK_GAS_LIMIT / 2 + 100_000;
-        let make_call = |nonce, hash_byte| PendingTransaction {
+        let first_gas = BLOCK_GAS_LIMIT / 2 + 100_000;
+        let second_gas = BLOCK_GAS_LIMIT / 2;
+        let make_call = |from, gas, hash_byte| PendingTransaction {
             hash: B256::repeat_byte(hash_byte),
-            from: DEV_ADDRESS,
+            from,
             to: TxKind::Call(contract),
             input: Bytes::new(),
             value: U256::ZERO,
-            nonce,
+            nonce: 0,
             gas,
             gas_price: 1,
             chain_id: CHAIN_ID,
@@ -490,7 +493,10 @@ mod tests {
         };
         let execution = execute_block(
             db,
-            &[make_call(0, 0xaa), make_call(1, 0xbb)],
+            &[
+                make_call(DEV_ADDRESS, first_gas, 0xaa),
+                make_call(DEV_ADDRESS_1, second_gas, 0xbb),
+            ],
             &parent(),
             1,
             2,
@@ -500,8 +506,9 @@ mod tests {
 
         assert_eq!(execution.transactions.len(), 1);
         assert_eq!(execution.receipts[0].status, 0);
-        assert_eq!(execution.gas_used, gas);
+        assert_eq!(execution.gas_used, first_gas);
         assert!(execution.gas_used <= BLOCK_GAS_LIMIT);
         assert_eq!(execution.accounts[&DEV_ADDRESS].nonce, 1);
+        assert_eq!(execution.accounts[&DEV_ADDRESS_1].nonce, 0);
     }
 }

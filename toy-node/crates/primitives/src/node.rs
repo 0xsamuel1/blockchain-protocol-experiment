@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::{
     BLOCK_GAS_LIMIT, EXTRA_DATA, GAS_PRICE, MAX_DIFFICULTY_LEADING_ZEROS,
-    MIN_DIFFICULTY_LEADING_ZEROS, TRANSFER_GAS,
+    MIN_DIFFICULTY_LEADING_ZEROS,
 };
 
 /// Account state used by Breeja, including directly stored contract storage.
@@ -133,6 +133,32 @@ pub struct Log {
     pub address: Address,
     pub topics: Vec<B256>,
     pub data: Bytes,
+}
+
+/// Builds Ethereum's 2048-bit log bloom for a receipt.
+///
+/// Each log address and topic contributes three bits. The bit positions are
+/// taken from the first six bytes of the value's Keccak-256 hash, exactly as
+/// specified by the Ethereum Yellow Paper.
+pub fn logs_bloom(logs: &[Log]) -> [u8; 256] {
+    let mut bloom = [0u8; 256];
+
+    for log in logs {
+        accrue_bloom(&mut bloom, log.address.as_slice());
+        for topic in &log.topics {
+            accrue_bloom(&mut bloom, topic.as_slice());
+        }
+    }
+
+    bloom
+}
+
+fn accrue_bloom(bloom: &mut [u8; 256], value: &[u8]) {
+    let hash = keccak256(value);
+    for pair in hash.as_slice()[..6].chunks_exact(2) {
+        let bit = (u16::from_be_bytes([pair[0], pair[1]]) & 0x07ff) as usize;
+        bloom[255 - bit / 8] |= 1 << (bit % 8);
+    }
 }
 
 /// A transaction that has been accepted into the mempool but not yet mined.
@@ -581,8 +607,10 @@ impl BlockState {
     /// This does not remove them. The miner may spend a long time failing to seal
     /// a block, and a transaction must stay pending until it is actually mined.
     pub fn peek_mempool_batch(&self) -> Vec<PendingTransaction> {
-        let max_txs = (BLOCK_GAS_LIMIT / TRANSFER_GAS) as usize;
-        self.mempool.iter().take(max_txs).cloned().collect()
+        // Gas use is only known after EVM execution. The executor considers the
+        // pending transactions in arrival order and commits each one only when
+        // its actual gas use still fits in the block.
+        self.mempool.clone()
     }
 
     // block production
@@ -726,6 +754,40 @@ mod tests {
             .insert(U256::from(4), U256::from(9));
 
         assert_ne!(state_root_of(&empty), state_root_of(&with_storage));
+    }
+
+    #[test]
+    fn the_state_root_commits_to_contract_code() {
+        let address = Address::repeat_byte(0x04);
+        let mut first = HashMap::new();
+        first.insert(address, Account::default());
+
+        let mut second = first.clone();
+        second.get_mut(&address).unwrap().code_hash = keccak256([0x60, 0x00]);
+
+        assert_ne!(state_root_of(&first), state_root_of(&second));
+    }
+
+    #[test]
+    fn a_log_bloom_contains_the_address_and_every_topic() {
+        let address = Address::repeat_byte(0x11);
+        let topic_a = B256::repeat_byte(0x22);
+        let topic_b = B256::repeat_byte(0x33);
+        let bloom = logs_bloom(&[Log {
+            address,
+            topics: vec![topic_a, topic_b],
+            data: Bytes::from_static(&[0xaa]),
+        }]);
+
+        assert_ne!(bloom, [0u8; 256]);
+        for value in [address.as_slice(), topic_a.as_slice(), topic_b.as_slice()] {
+            let hash = keccak256(value);
+            for pair in hash.as_slice()[..6].chunks_exact(2) {
+                let bit = (u16::from_be_bytes([pair[0], pair[1]]) & 0x07ff) as usize;
+                assert_ne!(bloom[255 - bit / 8] & (1 << (bit % 8)), 0);
+            }
+        }
+        assert_eq!(logs_bloom(&[]), [0u8; 256]);
     }
 
     #[test]

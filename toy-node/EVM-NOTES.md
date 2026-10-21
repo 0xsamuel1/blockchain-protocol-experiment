@@ -428,7 +428,27 @@ storage, inclusive block/address log filtering, address OR semantics, positional
 topic matching including wildcard and OR alternatives, complete mined-log
 metadata, and the configured gas price. All handlers are read-only.
 
-Validation still required on a machine with Rust installed: this recovery
-environment did not provide `cargo` or `rustfmt`, so the complete formatting,
-test, release-build, Clippy, and live Cast checks must be run before Milestone 5
-is considered complete.
+Milestone 5 was verified in CI with formatting, workspace tests, a release build,
+and strict Clippy checks.
+
+## Milestone 6: variable-gas consistency
+
+Mempool admission calculates the Shanghai intrinsic cost of each transaction:
+21,000 base gas, calldata byte charges, the contract-creation surcharge, and the
+initcode word charge. A transaction whose declared gas limit cannot cover that
+cost is rejected before it reaches the miner.
+
+The miner no longer limits a candidate using a fixed number of transfers. It
+passes the pending queue to the executor in arrival order. Each transaction is
+executed against a temporary state copy, and that copy is committed only when
+the transaction's actual gas use still fits under `BLOCK_GAS_LIMIT`. This keeps
+the block header's `gasUsed` equal to the cumulative gas in its receipts while
+preventing an over-limit transaction from leaking state changes.
+
+Receipt `logsBloom` is now a real 2048-bit Ethereum bloom. Every log address and
+topic contributes three bits derived from its Keccak-256 hash. Receipts without
+logs retain the canonical all-zero bloom.
+
+The simplified state root commits to balance, nonce, code hash, and a
+deterministic storage root. Tests prove that changing only contract code or one
+storage slot changes the state root.

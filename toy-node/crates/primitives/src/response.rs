@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     constants::{EXTRA_DATA, TRANSFER_GAS},
-    node::{Block, Log, Transaction, TransactionReceipt},
+    node::{Block, Log, Transaction, TransactionReceipt, logs_bloom},
 };
 
 /// Encodes a number as an Ethereum *quantity*: minimal hex, `0x0` for zero.
@@ -222,8 +222,7 @@ impl From<&TransactionReceipt> for TransactionReceiptResponse {
                     })
                 })
                 .collect(),
-            // A bloom filter over no logs is 256 zero bytes.
-            logs_bloom: format!("0x{}", "00".repeat(256)),
+            logs_bloom: format!("0x{}", alloy::hex::encode(logs_bloom(&receipt.logs))),
             status: quantity(receipt.status),
             tx_type: "0x0".to_owned(),
         }
