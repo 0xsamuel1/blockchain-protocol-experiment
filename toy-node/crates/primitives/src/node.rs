@@ -785,8 +785,7 @@ mod tests {
         for value in [address.as_slice(), topic_a.as_slice(), topic_b.as_slice()] {
             let hash = keccak256(value);
             for offset in [0, 2, 4] {
-                let bit =
-                    (u16::from_be_bytes([hash[offset], hash[offset + 1]]) & 0x07ff) as usize;
+                let bit = (u16::from_be_bytes([hash[offset], hash[offset + 1]]) & 0x07ff) as usize;
                 assert_ne!(bloom[255 - bit / 8] & (1 << (bit % 8)), 0);
             }
         }
