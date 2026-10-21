@@ -13,7 +13,7 @@ use node::{
         sign_contract_creation, sign_transfer,
     },
 };
-use primitives::node::BreejaGenesis;
+use primitives::{constants::GAS_PRICE, node::BreejaGenesis};
 use rpc::{RPCContext, start_server};
 use serde_json::Value;
 
@@ -760,12 +760,274 @@ async fn eth_call_rejects_invalid_gas_and_historical_evm_snapshots() {
 }
 
 #[tokio::test]
+async fn contract_inspection_methods_return_code_storage_logs_and_gas_price() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(10u64))], true).await;
+    // Runtime: storage[0] = 42; emit LOG0 with empty data; STOP.
+    let runtime = "0x602a60005560006000a000";
+    let initcode = Bytes::from_static(&[
+        0x60, 0x0b, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0b, 0x60, 0x00, 0xf3, 0x60, 0x2a, 0x60,
+        0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00,
+    ]);
+    let deployment =
+        sign_contract_creation(DEV_PRIVATE_KEY, U256::ZERO, 0, 100_000, initcode).unwrap();
+    let deployment_hash: String = harness
+        .client
+        .request(
+            "eth_sendRawTransaction",
+            rpc_params![deployment.to_string()],
+        )
+        .await
+        .unwrap();
+    harness
+        .wait_for("deployment receipt", |chain| {
+            chain
+                .read()
+                .get_receipt(&deployment_hash.parse().unwrap())
+                .is_some()
+        })
+        .await;
+    let deployment_receipt: Value = harness
+        .client
+        .request(
+            "eth_getTransactionReceipt",
+            rpc_params![deployment_hash],
+        )
+        .await
+        .unwrap();
+    let contract: Address = deployment_receipt["contractAddress"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let code: String = harness
+        .client
+        .request("eth_getCode", rpc_params![contract, "latest"])
+        .await
+        .unwrap();
+    assert_eq!(code, runtime);
+    let empty_code: String = harness
+        .client
+        .request(
+            "eth_getCode",
+            rpc_params![Address::repeat_byte(0xee), "latest"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_code, "0x");
+
+    let call = sign_contract_call(
+        DEV_PRIVATE_KEY,
+        contract,
+        U256::ZERO,
+        1,
+        100_000,
+        Bytes::new(),
+    )
+    .unwrap();
+    let call_hash: String = harness
+        .client
+        .request("eth_sendRawTransaction", rpc_params![call.to_string()])
+        .await
+        .unwrap();
+    harness
+        .wait_for("contract call receipt", |chain| {
+            chain
+                .read()
+                .get_receipt(&call_hash.parse().unwrap())
+                .is_some()
+        })
+        .await;
+    let call_receipt: Value = harness
+        .client
+        .request("eth_getTransactionReceipt", rpc_params![call_hash.clone()])
+        .await
+        .unwrap();
+    let call_block = call_receipt["blockNumber"].as_str().unwrap();
+
+    let slot: String = harness
+        .client
+        .request("eth_getStorageAt", rpc_params![contract, "0x0", "latest"])
+        .await
+        .unwrap();
+    assert_eq!(slot, format!("0x{}2a", "0".repeat(62)));
+    let empty_slot: String = harness
+        .client
+        .request("eth_getStorageAt", rpc_params![contract, "0x1", "latest"])
+        .await
+        .unwrap();
+    assert_eq!(empty_slot, format!("0x{}", "0".repeat(64)));
+
+    let logs: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({
+                "fromBlock": "earliest",
+                "toBlock": "latest",
+                "address": contract,
+            })],
+        )
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0]["address"], contract.to_string().to_lowercase());
+    assert_eq!(logs[0]["blockNumber"], call_block);
+    assert_eq!(logs[0]["transactionHash"], call_hash);
+    assert_eq!(logs[0]["topics"], serde_json::json!([]));
+    assert_eq!(logs[0]["data"], "0x");
+    assert_eq!(logs[0]["removed"], false);
+
+    let exact_block_logs: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({
+                "fromBlock": call_block.clone(),
+                "toBlock": call_block.clone(),
+                "address": [Address::repeat_byte(0xee), contract],
+            })],
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact_block_logs.len(), 1, "address arrays use OR semantics");
+
+    let excluded: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({
+                "fromBlock": "earliest",
+                "toBlock": "latest",
+                "address": Address::repeat_byte(0xee),
+            })],
+        )
+        .await
+        .unwrap();
+    assert!(excluded.is_empty());
+
+    // Deploy a second contract whose runtime emits LOG2 with topics A and B,
+    // then exercise positional, wildcard and OR topic-filter semantics through RPC.
+    let topic_a = alloy::primitives::B256::repeat_byte(0xaa);
+    let topic_b = alloy::primitives::B256::repeat_byte(0xbb);
+    let mut topic_runtime = vec![0x7f];
+    topic_runtime.extend_from_slice(topic_b.as_slice());
+    topic_runtime.push(0x7f);
+    topic_runtime.extend_from_slice(topic_a.as_slice());
+    topic_runtime.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xa2, 0x00]);
+    assert_eq!(topic_runtime.len(), 72);
+    let mut topic_initcode = vec![
+        0x60, 0x48, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x48, 0x60, 0x00, 0xf3,
+    ];
+    topic_initcode.extend_from_slice(&topic_runtime);
+    let deployment = sign_contract_creation(
+        DEV_PRIVATE_KEY,
+        U256::ZERO,
+        2,
+        150_000,
+        Bytes::from(topic_initcode),
+    )
+    .unwrap();
+    let hash: String = harness
+        .client
+        .request(
+            "eth_sendRawTransaction",
+            rpc_params![deployment.to_string()],
+        )
+        .await
+        .unwrap();
+    harness
+        .wait_for("topic contract deployment", |chain| {
+            chain.read().get_receipt(&hash.parse().unwrap()).is_some()
+        })
+        .await;
+    let receipt: Value = harness
+        .client
+        .request("eth_getTransactionReceipt", rpc_params![hash])
+        .await
+        .unwrap();
+    let topic_contract: Address = receipt["contractAddress"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let call = sign_contract_call(
+        DEV_PRIVATE_KEY,
+        topic_contract,
+        U256::ZERO,
+        3,
+        100_000,
+        Bytes::new(),
+    )
+    .unwrap();
+    let hash: String = harness
+        .client
+        .request("eth_sendRawTransaction", rpc_params![call.to_string()])
+        .await
+        .unwrap();
+    harness
+        .wait_for("topic contract call", |chain| {
+            chain.read().get_receipt(&hash.parse().unwrap()).is_some()
+        })
+        .await;
+
+    let topic_logs: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({
+                "fromBlock": "earliest",
+                "toBlock": "latest",
+                "address": topic_contract,
+                "topics": [topic_a, topic_b],
+            })],
+        )
+        .await
+        .unwrap();
+    assert_eq!(topic_logs.len(), 1);
+    let wildcard_logs: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({
+                "fromBlock": "earliest",
+                "toBlock": "latest",
+                "address": topic_contract,
+                "topics": [null, [topic_b, alloy::primitives::B256::ZERO]],
+            })],
+        )
+        .await
+        .unwrap();
+    assert_eq!(wildcard_logs.len(), 1);
+    let wrong_position: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({
+                "fromBlock": "earliest",
+                "toBlock": "latest",
+                "address": topic_contract,
+                "topics": [topic_b, topic_a],
+            })],
+        )
+        .await
+        .unwrap();
+    assert!(wrong_position.is_empty());
+
+    let gas_price: String = harness
+        .client
+        .request("eth_gasPrice", rpc_params![])
+        .await
+        .unwrap();
+    assert_eq!(from_quantity(&gas_price), GAS_PRICE);
+}
+
+#[tokio::test]
 async fn an_unsupported_method_gets_the_standard_method_not_found_error() {
     let harness = Harness::start(&[], false).await;
 
-    // `eth_gasPrice` is a real Ethereum method this node does not implement, so it
-    // must come back as -32601 rather than something invented.
-    let result: Result<Value, _> = harness.client.request("eth_gasPrice", rpc_params![]).await;
+    let result: Result<Value, _> = harness.client.request("eth_feeHistory", rpc_params![]).await;
     let error = result.expect_err("an unregistered method must be an error");
     assert!(
         error.to_string().contains("Method not found") || error.to_string().contains("-32601"),

@@ -395,3 +395,40 @@ Calling it produced:
 The same integration tests exercise deployment, call output, storage neutrality,
 revert errors, and exactly-estimated mined execution through the RPC server. No
 contract-inspection methods were added, and Milestone 5 was not started.
+
+## Milestone 5: contract inspection RPC
+
+`eth_getCode` resolves the requested block tag against Breeja's retained account
+snapshots, reads the code hash that was active for that account, and retrieves the
+content-addressed runtime bytecode. Unknown accounts and accounts without code
+return `0x`. Because bytecode is retained by hash, historical code queries remain
+honest even when an account's active code hash changes.
+
+`eth_getStorageAt` reads the requested 256-bit slot from the account snapshot for
+the resolved block. Missing accounts and slots read as zero. The RPC result is
+fixed-width 32-byte data rather than a minimal hex quantity, so decimal 42 is
+returned as 31 zero bytes followed by `2a`.
+
+`eth_getLogs` performs a direct read-only scan of canonical blocks and their
+receipts. The range is inclusive; omitted bounds default to `latest`. It accepts a
+single address or an OR-list of addresses. Topic filters are positional: positions
+are ANDed, `null` is a wildcard, and an array within one position is an OR-list.
+Results are emitted in block/transaction/log order with block hash/number,
+transaction hash/index, block-wide log index, and `removed: false`. Breeja has no
+reorganizations, and bloom-assisted searching waits for Milestone 6, so a direct
+scan is the truthful implementation for this teaching chain. `blockHash` is also
+supported and is mutually exclusive with range fields.
+
+`eth_gasPrice` returns Breeja's canonical fixed `GAS_PRICE` as a JSON-RPC quantity.
+This keeps the pre-EIP-1559 model while allowing standard `cast send --legacy`
+commands to autofill the price.
+
+Tests cover exact runtime code, empty code, slot zero containing 42, missing
+storage, inclusive block/address log filtering, address OR semantics, positional
+topic matching including wildcard and OR alternatives, complete mined-log
+metadata, and the configured gas price. All handlers are read-only.
+
+Validation still required on a machine with Rust installed: this recovery
+environment did not provide `cargo` or `rustfmt`, so the complete formatting,
+test, release-build, Clippy, and live Cast checks must be run before Milestone 5
+is considered complete.

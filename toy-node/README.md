@@ -1,14 +1,12 @@
-# Breeja — a proof-of-work Ethereum node with no EVM
+# Breeja — a proof-of-work Ethereum teaching node
 
 Breeja is a teaching implementation of an Ethereum execution node from the
 proof-of-work era, written in Rust. It mines blocks, validates signed
 transactions, maintains account state, and serves the Ethereum JSON-RPC API.
 
-That omission is the point of the exercise. Ethereum is usually taught EVM-first,
-as though the virtual machine were the whole system. Take the EVM out and what
-remains is still recognisably Ethereum: accounts, nonces, gas, signatures, a
-mempool, proof of work, a difficulty target, blocks linked by hash, and it fits
-in a few hundred lines you can read in an afternoon.
+Breeja began without an EVM so the surrounding protocol could be studied first.
+It now executes transfers and contracts through REVM while retaining its small,
+readable proof-of-work chain, mempool, account state, receipts, and JSON-RPC API.
 
 ```text
                    eth_sendRawTransaction
@@ -84,9 +82,16 @@ must never hold real funds.**
 
 ## Sending a transaction
 
-Breeja does not implement `eth_gasPrice`, so `cast send` cannot auto-fill its
-parameters. Build and sign the transaction offline with `cast mktx`, then submit
-the raw bytes.
+`eth_gasPrice`, transaction-count lookup, and gas estimation let Cast fill the
+legacy transaction parameters automatically:
+
+```bash
+cast send --legacy --rpc-url http://127.0.0.1:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --value 1ether 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+```
+
+You can still build and submit the raw bytes explicitly:
 
 ```bash
 RAW=$(cast mktx --legacy \
@@ -113,7 +118,7 @@ client waits for confirmation.
 
 ## The JSON-RPC API
 
-The same eleven methods from the assignment, now backed by real state.
+The original assignment methods plus EVM execution and contract inspection.
 
 | Method | Behaviour |
 | --- | --- |
@@ -125,11 +130,30 @@ The same eleven methods from the assignment, now backed by real state.
 | `eth_getTransactionReceipt` | Receipts for mined transactions; `null` while pending |
 | `eth_getBalance` | Balance at any historical block, or `pending` |
 | `eth_getTransactionCount` | Nonce; `pending` includes queued transactions |
-| `eth_sendRawTransaction` | Validates and queues a signed transfer |
-| `eth_call` | `0x` for a plain transfer; **error** if it needs the EVM |
-| `eth_estimateGas` | `0x5208` (21000); **error** if it needs the EVM |
+| `eth_sendRawTransaction` | Validates and queues signed transfers, deployments, and calls |
+| `eth_call` | Executes against a throwaway state snapshot and returns output bytes |
+| `eth_estimateGas` | Simulates and searches for a sufficient gas limit |
+| `eth_getCode` | Runtime code at an address and block tag; `0x` if none |
+| `eth_getStorageAt` | One fixed-width 32-byte storage word |
+| `eth_getLogs` | Logs filtered by block range/hash, address, and positional topics |
+| `eth_gasPrice` | Breeja's fixed legacy gas price |
 
 Anything else returns `-32601 Method not found`.
+
+Contract inspection examples (replace the address with your deployed contract):
+
+```bash
+CONTRACT=0x5fbdb2315678afecb367f032d93f642f64180aa3
+
+cast code --rpc-url http://127.0.0.1:8545 "$CONTRACT"
+cast storage --rpc-url http://127.0.0.1:8545 "$CONTRACT" 0
+
+curl -sS -X POST http://127.0.0.1:8545 \
+  -H 'Content-Type: application/json' \
+  --data "{\"jsonrpc\":\"2.0\",\"method\":\"eth_getLogs\",\"params\":[{\"fromBlock\":\"earliest\",\"toBlock\":\"latest\",\"address\":\"$CONTRACT\"}],\"id\":1}"
+
+cast rpc --rpc-url http://127.0.0.1:8545 eth_gasPrice
+```
 
 ## Chain parameters
 

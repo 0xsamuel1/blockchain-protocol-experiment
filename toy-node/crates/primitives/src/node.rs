@@ -463,6 +463,17 @@ impl BlockState {
         self.get_code_by_hash(&account.code_hash)
     }
 
+    /// Returns the code associated with an account at a historical block.
+    /// Code is content-addressed and retained, while the account snapshot tells
+    /// us which code hash was active at that block.
+    pub fn get_code_at(&self, address: &Address, number: u64) -> Option<Bytes> {
+        let account = self.get_account_at(address, number)?;
+        if account.code_hash == B256::ZERO {
+            return Some(Bytes::new());
+        }
+        self.get_code_by_hash(&account.code_hash)
+    }
+
     /// Returns bytecode by its content hash. The zero hash and Ethereum's empty
     /// code hash both represent empty code; an unknown non-empty hash returns
     /// `None`.
@@ -487,6 +498,12 @@ impl BlockState {
             .get(address)
             .and_then(|account| account.storage.get(slot).copied())
             .unwrap_or_default()
+    }
+
+    /// Returns a storage slot from the account snapshot after `number`.
+    pub fn get_storage_at(&self, address: &Address, slot: &U256, number: u64) -> Option<U256> {
+        self.get_account_at(address, number)
+            .map(|account| account.storage.get(slot).copied().unwrap_or_default())
     }
 
     /// Account as it was after block `number`, or `None` if that block does not

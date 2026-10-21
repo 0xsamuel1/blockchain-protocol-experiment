@@ -11,9 +11,10 @@ use node::{
 use primitives::{
     constants::{BLOCK_GAS_LIMIT, CHAIN_ID, GAS_PRICE},
     node::BlockState,
-    params::{BlockTag, CallRequest},
+    params::{AddressFilter, BlockTag, CallRequest, LogFilter, TopicFilter},
     response::{
-        BlockResponse, TransactionReceiptResponse, TransactionResponse, data_hash, quantity,
+        BlockResponse, LogResponse, TransactionReceiptResponse, TransactionResponse, data_bytes,
+        data_hash, quantity,
     },
 };
 use revm::{
@@ -201,6 +202,127 @@ pub fn get_transaction_count_handler(
     };
 
     Ok(quantity(nonce))
+}
+
+/// Returns runtime bytecode at a block, or `0x` for an EOA/unknown account.
+pub fn get_code_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+    let tag = sequence
+        .optional_next::<BlockTag>()?
+        .unwrap_or(BlockTag::Latest);
+
+    let state = context.chain.read();
+    let number = resolve_tag(&state, &tag)?;
+    Ok(data_bytes(
+        &state.get_code_at(&address, number).unwrap_or_default(),
+    ))
+}
+
+/// Returns one EVM storage word as fixed-width 32-byte data.
+pub fn get_storage_at_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+    let raw_slot: String = sequence.next()?;
+    let slot = raw_slot
+        .parse::<U256>()
+        .map_err(|error| invalid_params(format!("invalid storage slot {raw_slot:?}: {error}")))?;
+    let tag = sequence
+        .optional_next::<BlockTag>()?
+        .unwrap_or(BlockTag::Latest);
+
+    let state = context.chain.read();
+    let number = resolve_tag(&state, &tag)?;
+    let value = state
+        .get_storage_at(&address, &slot, number)
+        .unwrap_or_default();
+    Ok(format!("{value:#066x}"))
+}
+
+fn address_matches(filter: &Option<AddressFilter>, address: &Address) -> bool {
+    match filter {
+        None => true,
+        Some(AddressFilter::One(expected)) => expected == address,
+        Some(AddressFilter::Many(expected)) => expected.contains(address),
+    }
+}
+
+fn topics_match(filter: &[Option<TopicFilter>], topics: &[B256]) -> bool {
+    filter.iter().enumerate().all(|(index, expected)| {
+        let Some(expected) = expected else {
+            return true;
+        };
+        let Some(actual) = topics.get(index) else {
+            return false;
+        };
+        match expected {
+            TopicFilter::One(expected) => actual == expected,
+            TopicFilter::AnyOf(expected) => expected.contains(actual),
+        }
+    })
+}
+
+/// Scans canonical receipts in block order and applies Ethereum's positional
+/// address/topic filter semantics. Breeja is small enough not to need a bloom
+/// index yet; bloom construction belongs to Milestone 6.
+pub fn get_logs_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<Vec<LogResponse>> {
+    let filter: LogFilter = params.one()?;
+    let state = context.chain.read();
+    let head = state.get_block_number();
+
+    let (from, to) = if let Some(hash) = filter.block_hash {
+        if filter.from_block.is_some() || filter.to_block.is_some() {
+            return Err(invalid_params(
+                "blockHash cannot be combined with fromBlock or toBlock",
+            ));
+        }
+        let Some(block) = state.get_block_by_hash(&hash) else {
+            return Ok(Vec::new());
+        };
+        (block.number, block.number)
+    } else {
+        let from = resolve_tag(&state, &filter.from_block.unwrap_or(BlockTag::Latest))?;
+        let to = resolve_tag(&state, &filter.to_block.unwrap_or(BlockTag::Latest))?;
+        if from > to {
+            return Err(invalid_params(format!(
+                "fromBlock ({from}) is after toBlock ({to})"
+            )));
+        }
+        (from, to.min(head))
+    };
+
+    let mut matches = Vec::new();
+    for number in from..=to {
+        let Some(block) = state.get_block(number) else {
+            continue;
+        };
+        let mut block_log_index = 0u64;
+        for (transaction_index, transaction_hash) in block.transactions.iter().enumerate() {
+            let Some(receipt) = state.get_receipt(transaction_hash) else {
+                continue;
+            };
+            for log in &receipt.logs {
+                if address_matches(&filter.address, &log.address)
+                    && topics_match(&filter.topics, &log.topics)
+                {
+                    matches.push(LogResponse::from_mined(
+                        log,
+                        block,
+                        transaction_hash,
+                        transaction_index as u64,
+                        block_log_index,
+                    ));
+                }
+                block_log_index += 1;
+            }
+        }
+    }
+    Ok(matches)
+}
+
+/// Breeja has a fixed pre-EIP-1559 gas price and no fee market.
+pub fn gas_price_handler() -> String {
+    quantity(GAS_PRICE)
 }
 
 /// Accepts a signed transaction, validates it, and queues it for mining.
@@ -413,4 +535,53 @@ pub fn estimate_gas_handler(params: Params<'_>, context: &RPCContext) -> RpcResu
         ExecutionResult::Revert { .. } | ExecutionResult::Halt { .. } => upper,
     };
     Ok(quantity(estimate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topic_filters_are_positional_with_wildcards_and_or_alternatives() {
+        let a = B256::repeat_byte(0xaa);
+        let b = B256::repeat_byte(0xbb);
+        let c = B256::repeat_byte(0xcc);
+        let actual = [a, b];
+
+        assert!(topics_match(&[], &actual));
+        assert!(topics_match(&[Some(TopicFilter::One(a))], &actual));
+        assert!(!topics_match(&[Some(TopicFilter::One(b))], &actual));
+        assert!(topics_match(
+            &[None, Some(TopicFilter::One(b))],
+            &actual
+        ));
+        assert!(topics_match(
+            &[Some(TopicFilter::AnyOf(vec![c, a]))],
+            &actual
+        ));
+        assert!(!topics_match(
+            &[Some(TopicFilter::AnyOf(Vec::new()))],
+            &actual
+        ));
+        assert!(!topics_match(
+            &[None, None, Some(TopicFilter::One(c))],
+            &actual
+        ));
+    }
+
+    #[test]
+    fn address_arrays_use_or_semantics_and_empty_arrays_match_nothing() {
+        let a = Address::repeat_byte(0xaa);
+        let b = Address::repeat_byte(0xbb);
+        assert!(address_matches(&None, &a));
+        assert!(address_matches(&Some(AddressFilter::One(a)), &a));
+        assert!(address_matches(
+            &Some(AddressFilter::Many(vec![b, a])),
+            &a
+        ));
+        assert!(!address_matches(
+            &Some(AddressFilter::Many(Vec::new())),
+            &a
+        ));
+    }
 }

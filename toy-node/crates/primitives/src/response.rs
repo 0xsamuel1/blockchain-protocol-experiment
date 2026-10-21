@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     constants::{EXTRA_DATA, TRANSFER_GAS},
-    node::{Block, Transaction, TransactionReceipt},
+    node::{Block, Log, Transaction, TransactionReceipt},
 };
 
 /// Encodes a number as an Ethereum *quantity*: minimal hex, `0x0` for zero.
@@ -109,6 +109,43 @@ pub struct TransactionReceiptResponse {
     pub status: String,
     #[serde(rename = "type")]
     pub tx_type: String,
+}
+
+/// A mined EVM log as returned by `eth_getLogs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LogResponse {
+    pub address: String,
+    pub topics: Vec<String>,
+    pub data: String,
+    pub block_number: String,
+    pub block_hash: String,
+    pub transaction_hash: String,
+    pub transaction_index: String,
+    pub log_index: String,
+    pub removed: bool,
+}
+
+impl LogResponse {
+    pub fn from_mined(
+        log: &Log,
+        block: &Block,
+        transaction_hash: &B256,
+        transaction_index: u64,
+        log_index: u64,
+    ) -> Self {
+        Self {
+            address: data_address(&log.address),
+            topics: log.topics.iter().map(data_hash).collect(),
+            data: data_bytes(&log.data),
+            block_number: quantity(block.number),
+            block_hash: data_hash(&block.hash),
+            transaction_hash: data_hash(transaction_hash),
+            transaction_index: quantity(transaction_index),
+            log_index: quantity(log_index),
+            removed: false,
+        }
+    }
 }
 
 impl BlockResponse {
