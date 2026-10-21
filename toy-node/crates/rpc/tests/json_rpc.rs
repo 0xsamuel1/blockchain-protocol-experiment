@@ -881,8 +881,8 @@ async fn contract_inspection_methods_return_code_storage_logs_and_gas_price() {
         .request(
             "eth_getLogs",
             rpc_params![serde_json::json!({
-                "fromBlock": call_block.clone(),
-                "toBlock": call_block.clone(),
+                "fromBlock": call_block,
+                "toBlock": call_block,
                 "address": [Address::repeat_byte(0xee), contract],
             })],
         )
