@@ -155,8 +155,8 @@ pub fn logs_bloom(logs: &[Log]) -> [u8; 256] {
 
 fn accrue_bloom(bloom: &mut [u8; 256], value: &[u8]) {
     let hash = keccak256(value);
-    for pair in hash.as_slice()[..6].chunks_exact(2) {
-        let bit = (u16::from_be_bytes([pair[0], pair[1]]) & 0x07ff) as usize;
+    for offset in [0, 2, 4] {
+        let bit = (u16::from_be_bytes([hash[offset], hash[offset + 1]]) & 0x07ff) as usize;
         bloom[255 - bit / 8] |= 1 << (bit % 8);
     }
 }
@@ -784,8 +784,9 @@ mod tests {
         assert_ne!(bloom, [0u8; 256]);
         for value in [address.as_slice(), topic_a.as_slice(), topic_b.as_slice()] {
             let hash = keccak256(value);
-            for pair in hash.as_slice()[..6].chunks_exact(2) {
-                let bit = (u16::from_be_bytes([pair[0], pair[1]]) & 0x07ff) as usize;
+            for offset in [0, 2, 4] {
+                let bit =
+                    (u16::from_be_bytes([hash[offset], hash[offset + 1]]) & 0x07ff) as usize;
                 assert_ne!(bloom[255 - bit / 8] & (1 << (bit % 8)), 0);
             }
         }
