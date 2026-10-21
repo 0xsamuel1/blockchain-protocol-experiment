@@ -10,11 +10,10 @@ use node::Chain;
 use primitives::constants::RPC_ADDRESS;
 
 use crate::handlers::{
-    block_number_handler, call_handler, chain_id_handler, estimate_gas_handler,
-    gas_price_handler, get_balance_handler, get_block_by_hash_handler,
-    get_block_by_number_handler, get_code_handler, get_logs_handler, get_storage_at_handler,
-    get_transaction_by_hash_handler, get_transaction_count_handler, get_transaction_receipt_handler,
-    send_raw_transaction_handler,
+    block_number_handler, call_handler, chain_id_handler, estimate_gas_handler, gas_price_handler,
+    get_balance_handler, get_block_by_hash_handler, get_block_by_number_handler, get_code_handler,
+    get_logs_handler, get_storage_at_handler, get_transaction_by_hash_handler,
+    get_transaction_count_handler, get_transaction_receipt_handler, send_raw_transaction_handler,
 };
 
 /// What every RPC handler is given access to: the live chain.

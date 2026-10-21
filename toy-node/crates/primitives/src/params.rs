@@ -186,9 +186,6 @@ mod tests {
         assert!(matches!(filter.address, Some(AddressFilter::Many(_))));
         assert!(filter.topics[0].is_none());
         assert_eq!(filter.topics[1], Some(TopicFilter::One(a)));
-        assert_eq!(
-            filter.topics[2],
-            Some(TopicFilter::AnyOf(vec![a, b]))
-        );
+        assert_eq!(filter.topics[2], Some(TopicFilter::AnyOf(vec![a, b])));
     }
 }

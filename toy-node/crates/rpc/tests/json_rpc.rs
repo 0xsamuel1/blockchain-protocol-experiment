@@ -789,10 +789,7 @@ async fn contract_inspection_methods_return_code_storage_logs_and_gas_price() {
         .await;
     let deployment_receipt: Value = harness
         .client
-        .request(
-            "eth_getTransactionReceipt",
-            rpc_params![deployment_hash],
-        )
+        .request("eth_getTransactionReceipt", rpc_params![deployment_hash])
         .await
         .unwrap();
     let contract: Address = deployment_receipt["contractAddress"]
@@ -1027,7 +1024,10 @@ async fn contract_inspection_methods_return_code_storage_logs_and_gas_price() {
 async fn an_unsupported_method_gets_the_standard_method_not_found_error() {
     let harness = Harness::start(&[], false).await;
 
-    let result: Result<Value, _> = harness.client.request("eth_feeHistory", rpc_params![]).await;
+    let result: Result<Value, _> = harness
+        .client
+        .request("eth_feeHistory", rpc_params![])
+        .await;
     let error = result.expect_err("an unregistered method must be an error");
     assert!(
         error.to_string().contains("Method not found") || error.to_string().contains("-32601"),

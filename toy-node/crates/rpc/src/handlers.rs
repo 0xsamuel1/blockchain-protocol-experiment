@@ -551,10 +551,7 @@ mod tests {
         assert!(topics_match(&[], &actual));
         assert!(topics_match(&[Some(TopicFilter::One(a))], &actual));
         assert!(!topics_match(&[Some(TopicFilter::One(b))], &actual));
-        assert!(topics_match(
-            &[None, Some(TopicFilter::One(b))],
-            &actual
-        ));
+        assert!(topics_match(&[None, Some(TopicFilter::One(b))], &actual));
         assert!(topics_match(
             &[Some(TopicFilter::AnyOf(vec![c, a]))],
             &actual
@@ -575,13 +572,7 @@ mod tests {
         let b = Address::repeat_byte(0xbb);
         assert!(address_matches(&None, &a));
         assert!(address_matches(&Some(AddressFilter::One(a)), &a));
-        assert!(address_matches(
-            &Some(AddressFilter::Many(vec![b, a])),
-            &a
-        ));
-        assert!(!address_matches(
-            &Some(AddressFilter::Many(Vec::new())),
-            &a
-        ));
+        assert!(address_matches(&Some(AddressFilter::Many(vec![b, a])), &a));
+        assert!(!address_matches(&Some(AddressFilter::Many(Vec::new())), &a));
     }
 }
