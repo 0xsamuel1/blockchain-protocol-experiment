@@ -654,6 +654,8 @@ impl BlockState {
 
 #[cfg(test)]
 mod tests {
+    use crate::constants::TRANSFER_GAS;
+
     use super::*;
 
     #[test]
